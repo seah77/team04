@@ -16,7 +16,7 @@ app.add_middleware(
 )
 
 # 라우터 등록
-app.include_router(ocr.router, prefix="/api/v1")
+app.include_router(ocr.router)
 
 @app.get("/")
 def read_root():
