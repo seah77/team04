@@ -1,0 +1,11 @@
+# 모델 파일(models/ad_model_v2.joblib)은 scikit-learn 1.9.1로 저장됨. 버전이 다르면 다시 학습하세요.
+scikit-learn==1.9.1
+numpy>=2.0
+scipy>=1.13
+pandas>=2.2
+joblib>=1.4
+openpyxl>=3.1
+
+# 선택
+# easyocr          # src/ocr_to_sheet.py 로 사진을 직접 읽을 때
+# sentence-transformers   # --embed 로 임베딩 모델 비교할 때
