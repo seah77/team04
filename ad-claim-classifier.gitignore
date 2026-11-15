@@ -1,0 +1,24 @@
+# 공식 데이터 (용량 큼, data/official/README.md 참고)
+data/official/*.gz
+data/official/*.csv
+
+# 사진·개인 자료
+photos/
+사진/
+*.jpg
+*.jpeg
+*.png
+*.heic
+
+# 비밀 정보 (API 키 등)
+.env
+*.key
+
+# 파이썬·편집기
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.venv/
+venv/
+.DS_Store
+~$*.xlsx
