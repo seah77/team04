@@ -175,7 +175,27 @@ def rule_override(text, ml_label):
     # 체험기·원료 효능은 효과를 말하는 문장 → '해당 없음'으로 나오면 기능·효과로 올림
     if ml_label in (NONE, '확인 필요') and tags & {'체험기·후기 표현', '원료 효능 설명'}:
         return '기능·효과 표현'
+    # '간 건강', '간 유산균', '장 튼튼'처럼 기능 대상어 + 기능 단어 → 기능·효과
+    if ml_label in (NONE, '확인 필요') and R.targets(text) and FUNC_WORD.search(text):
+        return '기능·효과 표현'
     return ml_label
+
+
+FUNC_WORD = re.compile(r'건강|케어|관리|기능|유산균|영양제|개선|강화|튼튼|지킴|증진|도움|보호|활력|'
+                       r'싹|쏙|뚝|쑥|활활|팍팍|끝|해결|챙기|좋은|좋아')
+
+
+def is_noise(text, bundle):
+    """짧고, 학습 때 본 적 없는 글자 조합이면 OCR 잡음으로 봄 (예: '단절곡')"""
+    core = re.sub(r'[^가-힣A-Za-z0-9]', '', text)
+    if len(core) > 6 or R.targets(text) or R.rule_tags(text):
+        return False
+    try:
+        vocab = dict(bundle['model'].named_steps['특징'].transformer_list)['글자'].vocabulary_
+    except Exception:
+        return False
+    pairs = [core[i:i + 2] for i in range(len(core) - 1) if re.match(r'[가-힣]{2}', core[i:i + 2])]
+    return bool(pairs) and not any(p in vocab for p in pairs)
 
 
 # ------------------------------------------------------------------ 공식 기능성 비교
@@ -194,67 +214,218 @@ def key_tokens(s):
 
 
 class OfficialMatcher:
+    """
+    광고 문장 ↔ 공식 기능성 문구 비교.
+    1) 문장의 기능 대상어(간, 장, 면역, 혈당 ...)를 뽑아, 대상어마다 공식 문구에 있는지 확인
+    2) 대상어가 없으면 글자 유사도로 가장 가까운 공식 문구를 찾음
+    결과 level: 확인됨 / 표현이 다름 / 일부만 확인 / 확인되지 않음
+    """
     def __init__(self, pool):
         self.pool = pool
         self.vec = TfidfVectorizer(analyzer='char_wb', ngram_range=(2, 4), sublinear_tf=True)
         self.M = self.vec.fit_transform(pool) if pool else None
+        self.tg = [set(R.targets(x)) for x in pool]
 
     def match(self, text, candidates=None):
-        pool = candidates or self.pool
-        if not pool:
-            return {'level': '비교 불가', 'nearest': None, 'score': 0.0}
         if candidates:
+            pool = candidates
             vec = TfidfVectorizer(analyzer='char_wb', ngram_range=(2, 4), sublinear_tf=True).fit(pool + [text])
             M, q = vec.transform(pool), vec.transform([text])
+            tgs = [set(R.targets(x)) for x in pool]
         else:
-            M, q = self.M, self.vec.transform([text])
+            pool, M, tgs = self.pool, self.M, self.tg
+            if not pool:
+                return {'level': '비교 불가', 'nearest': None, 'score': 0.0, 'targets': []}
+            q = self.vec.transform([text])
         sims = (M @ q.T).toarray().ravel()
-        i = int(sims.argmax()); sc = float(sims[i]); near = pool[i]
-        shared = key_tokens(text) & key_tokens(near)
         official_form = bool(re.search(r'도움을?\s*줄\s*수\s*있', text))
-        if sc >= 0.7 and shared and official_form:   # 공식 문구 형식("~에 도움을 줄 수 있음")일 때만 '확인됨'
+        want = R.targets(text)
+
+        if want:                                   # 대상어별로 확인
+            per = []
+            for t in want:
+                idx = [i for i, g in enumerate(tgs) if t in g]
+                if idx:
+                    j = max(idx, key=lambda i: sims[i])
+                    per.append({'target': t, 'found': True, 'official': pool[j], 'score': round(float(sims[j]), 2)})
+                else:
+                    per.append({'target': t, 'found': False, 'official': None, 'score': 0.0})
+            found = [x for x in per if x['found']]
+            best = max(found, key=lambda x: x['score']) if found else None
+            if found and len(found) == len(per):
+                lv = '확인됨' if official_form and best['score'] >= 0.7 else '표현이 다름'
+            elif found:
+                lv = '일부만 확인'
+            else:
+                lv = '확인되지 않음'
+            return {'level': lv, 'nearest': best['official'] if best else None,
+                    'score': best['score'] if best else 0.0, 'targets': per}
+
+        i = int(sims.argmax()); sc = float(sims[i]); near = pool[i]      # 대상어 없음 → 유사도
+        shared = key_tokens(text) & key_tokens(near)
+        if sc >= 0.7 and shared and official_form:
             lv = '확인됨'
         elif sc >= 0.3 and shared:
             lv = '표현이 다름'
         else:
             lv = '확인되지 않음'
-        return {'level': lv, 'nearest': near if lv != '확인되지 않음' else None, 'score': round(sc, 2),
-                'shared': sorted(shared)}
+        return {'level': lv, 'nearest': near if lv != '확인되지 않음' else None, 'score': round(sc, 2), 'targets': []}
+
+
+def clean_fnclty(text):
+    """I0030 기능성 글 → 한국어 문장 목록 ('(영문)' 줄 제거, '(국문)', '1.', '①' 같은 머리말 제거)"""
+    out = []
+    for line in re.split(r'[\n\r]+', str(text)):
+        line = line.strip()
+        if (not line or line.startswith('(영문)') or not re.search('[가-힣]', line)
+                or re.match(r'^\[.*\]$', line)):          # '[원료명]' 같은 머리글 줄
+            continue
+        line = re.sub(r'^\(국문\)\s*', '', line)
+        for part in re.split(r'(?=[①-⑳])|(?<=있음)\s*[,.]?\s*(?=\d+\.)', line):
+            part = re.sub(r'^[\s①-⑳\d.)\-(·\[\]]+', '', part).strip(' ,.')
+            if len(part) >= 4 and re.search('[가-힣]', part):
+                out.append(part)
+    return out or R.split_sentences(text)
+
+
+def ingredient_messages(item, ings, product_kind, functions_for):
+    """광고에 나온 원료의 인정 기능성으로 보충 설명 [(참조 dict, 문구)]  — 문구는 data/messages.json"""
+    from messages import msg
+    if not ings:
+        return []
+    off = item.get('official') or {}
+    status = {x['target']: x['found'] for x in off.get('targets', [])}
+    out = []
+    for t in item.get('targets', []):
+        hits = functions_for(t, ings)
+        ref = {'target': t, 'ingredient': hits[0][0] if hits else None, 'function': hits[0][1] if hits else None}
+        if product_kind == '건강기능식품':
+            if status.get(t) is False and hits:       # 이 제품 기능성엔 없지만 원료 일반 기능성엔 있음
+                n, f = hits[0]
+                out.append((ref, msg('ingredient.hf_not_in_product', ingredient=n, function=f, target=t)))
+        elif product_kind == '일반식품':
+            if hits:
+                n, f = hits[0]
+                out.append((ref, msg('ingredient.general_food', ingredient=n, function=f, target=t)))
+        else:
+            if hits:
+                n, f = hits[0]
+                out.append((ref, msg('ingredient.unknown_found', ingredient=n, function=f, target=t)))
+            else:
+                names = ', '.join(dict.fromkeys(g['short'] for g in ings))
+                out.append((ref, msg('ingredient.unknown_missing', ingredients=names, target=t)))
+    return out
+
+
+def _josa(word, a='은', b='는'):
+    """받침에 맞는 조사 (간은 / 장은 / 면역은 / 피부는)"""
+    ch = word[-1]
+    if '가' <= ch <= '힣':
+        return a if (ord(ch) - 0xAC00) % 28 else b
+    return a
+
+
+def official_message(off, product_kind):
+    """공식 비교 결과 + 제품 종류 → 안내 문구 (판정하지 않고, 공식 정보와 같은지 다른지만 말함)
+    문구는 data/messages.json 의 "official" 항목"""
+    from messages import msg, josa_list
+    lv, near = off.get('level'), off.get('nearest')
+    found = [x['target'] for x in off.get('targets', []) if x['found']]
+    miss = [x['target'] for x in off.get('targets', []) if not x['found']]
+    kw = {'official': near or '', 'found': josa_list(found), 'missing': josa_list(miss)}
+    if product_kind == '일반식품':
+        return msg('official.general_food', **kw)
+    if product_kind == '건강기능식품':
+        if lv == '확인됨':
+            return msg('official.hf_same', **kw)
+        if lv == '표현이 다름' and found and not miss:
+            return msg('official.hf_same_target_diff_wording', **kw)
+        if lv == '표현이 다름':
+            return msg('official.hf_diff_wording', **kw)
+        if lv == '일부만 확인':
+            return msg('official.hf_partial', **kw)
+        if not off.get('targets'):                 # '아침이 달라졌어요'처럼 비교할 대상어가 없는 문장
+            return msg('official.hf_none_no_target', **kw)
+        return msg('official.hf_none', **kw)
+    # 제품을 찾지 못한 경우 → 전체 공식 문구와 비교
+    if lv in ('확인됨', '표현이 다름', '일부만 확인') and near:
+        return msg('official.unknown_similar', **kw)
+    return msg('official.unknown_none', **kw)
 
 
 # ------------------------------------------------------------------ 분석 (서버에서 쓰는 함수)
 def load_bundle(path):
     b = joblib.load(path)
     R.INGREDIENT[:] = b['ingredients']
-    b['matcher'] = OfficialMatcher(b['official_pool'])
+    # 공식 문구 정리: '홍삼] ① 면역력 증진…②…' 같은 머리말·번호를 떼고 한 문장씩 나눔
+    pool = []
+    for x in b['official_pool']:
+        for part in clean_fnclty(re.sub(r'^[^\]\n]{0,40}\]\s*', '', x)):
+            part = re.sub(r'^[^\]]{0,40}\]\s*', '', part)                       # '홍삼] …'
+            part = re.sub(r'^[^:：]{0,60}[:：]\s*', '', part).strip(' ‘’\'"「」')        # '코엔자임Q10: …'
+            part = re.sub(r'^[가-힣A-Za-z0-9 ]{1,20}\s*-\s+', '', part)          # '녹차추출물- …'
+            for _ in range(3):                                                 # '(1) …', '(가) …', 'NAG, …) …'
+                part = re.sub(r'^\(?(\d+|[가-하])\)\s*|^[^()]{0,30}\)\s*|^[\d①-⑩.\s]+(?=[가-힣])|^\((국문|한글)\)\s*|^[,\-–·•*※\s]+', '', part).strip()
+            part = re.sub(r'^<[^>]{1,40}>\s*', '', part)                         # '<프로바이오틱스>…'
+            part = re.sub(r'[“”‘’"\']', '', part)
+            part = re.sub(r'\s*\((기타|생리활성)[^)]{0,20}\)', '', part)            # '(기타기능II)' 등급 표시
+            part = re.sub(r'^[^가-힣A-Za-z]+', '', part).strip()                  # 앞에 남은 기호·번호 (⑴, ‧, : …)
+            first = part.split(' ')[0] if part else ''
+            if (6 <= len(part) <= 80 and ('도움' in part or '필요' in part)
+                    and not re.search(r'(하여|하고|및|으로|로|를|을)$', first)):   # '개선하여 …' 같은 조각 제외
+                pool.append(part)
+    b['matcher'] = OfficialMatcher(sorted(set(pool)))
     return b
 
 
-def analyze_text(text, bundle, product_fnclty=None, threshold=None):
-    """OCR 전체 글 → 문장별 결과 목록 (FastAPI에서 그대로 JSON으로 돌려주면 됨)"""
+def analyze_text(text, bundle, product_fnclty=None, threshold=None, product_kind=None, context_text=None):
+    """
+    OCR 전체 글 → 문장별 결과 목록 (FastAPI에서 그대로 JSON으로 돌려주면 됨)
+    product_fnclty: 건강기능식품으로 확인된 제품의 인정 기능성 (I0030 PRIMARY_FNCLTY)
+    product_kind  : '건강기능식품' / '일반식품' / None(제품 미확인)
+    """
     th = bundle['threshold'] if threshold is None else threshold
     sents = R.split_sentences(text)
     if not sents:
         return []
+    if product_fnclty and not product_kind:
+        product_kind = '건강기능식품'
     proba = bundle['model'].predict_proba(sents)
     classes = list(bundle['model'].classes_)
-    cand = R.split_sentences(product_fnclty) if product_fnclty else None
+    cand = clean_fnclty(product_fnclty) if product_fnclty else None
+    from ingredients import find_ingredients, functions_for
+    from messages import msg
+    ings = find_ingredients(context_text or text)  # 광고 글 전체(사진 여러 장이면 모든 사진)에 나온 원료
     out = []
     for s, pr in zip(sents, proba):
         i = int(np.argmax(pr)); p = float(pr[i])
         ml = classes[i] if p >= th else '확인 필요'
+        if R.LABEL_INFO.search(s):                 # 포장 뒷면 의무 표시사항 → 분석에서 뺌
+            out.append({'text': s, 'type': NONE, 'ml_type': classes[i], 'prob': round(p, 2), 'targets': [],
+                        'rule_tags': [], 'messages': [], 'is_label_info': True})
+            continue
         tags = R.rule_tags(s)
         final = rule_override(s, ml)
+        if final not in (NONE, '확인 필요') and not tags and is_noise(s, bundle):
+            final = '확인 필요'                       # OCR 잡음으로 보이는 짧은 글자
         item = {'text': s, 'type': final, 'ml_type': classes[i], 'prob': round(p, 2),
+                'targets': R.targets(s),
                 'rule_tags': [{'tag': k, 'evidence': v} for k, v in tags], 'messages': []}
+        for k, _ in tags:                           # 규칙 태그 안내 (data/messages.json 의 "tag")
+            text_ = (msg(f'tag.{k}/{product_kind}') if product_kind else '') or msg(f'tag.{k}') or R.DISPLAY.get(k, '')
+            item['messages'].append(text_)
+        if final in ('질병 예방·치료 표현', '의약품 연상 표현') and not tags:
+            item['messages'].append(msg(f'tag.{final}'))   # 머신러닝만 이 유형으로 본 경우에도 같은 안내
         if final in ('기능·효과 표현', '공식 기능성 문구'):
-            item['official'] = bundle['matcher'].match(s, cand)
-        for k, _ in tags:
-            item['messages'].append(R.DISPLAY.get(k, ''))
-        if final == '기능·효과 표현' and not tags:
-            item['messages'].append('몸의 기능·효과를 말하는 표현입니다. 공식 기능성 문구와 비교해 보세요.')
+            if product_kind != '일반식품':           # 일반식품은 비교할 인정 기능성이 없음
+                item['official'] = bundle['matcher'].match(s, cand if product_kind == '건강기능식품' else None)
+            item['messages'].append(official_message(item.get('official', {}), product_kind))
+            refs = ingredient_messages(item, ings, product_kind, functions_for)
+            if refs:
+                item['ingredient_refs'] = [r for r, _ in refs]
+                item['messages'].extend(m for _, m in refs)
         if final == '확인 필요':
-            item['messages'].append('표현 유형을 자동으로 판단하기 어렵습니다.')
+            item['messages'].append(msg('sentence.unclear'))
         item['messages'] = list(dict.fromkeys(m for m in item['messages'] if m))
         out.append(item)
     return out

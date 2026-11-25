@@ -122,29 +122,42 @@ def get_bundle(model_path=DEFAULT_MODEL):
     return _BUNDLE
 
 
-_END = re.compile(r'([.!?。~]|[다요죠까네음함임됨])["\')\]]*$')
+_END = re.compile(r'([.!?。~]|[다요죠까네음함임됨오]|\])["\')\]]*$')   # '…하십시오', '[주의사항]' 도 끝으로 봄
+
+
+_LABEL = re.compile(r'품목\s*(보고|제조)?\s*번호|원재료|내용량|영양|유통기한|소비기한|제조원|판매원|섭취\s*방법|보관')
+
+
+# 앞 줄이 이런 글자로 끝나면 문장이 이어지는 중으로 봄 (조사·연결어미·쉼표)
+_CONT = re.compile(r'(의|및|와|과|을|를|에|에서|으로|로|고|며|서|는|은|이|가|한|할|된|될|인|하여|하고|,|·)$')
 
 
 def merge_lines(text):
     """
     줄바꿈으로 잘린 문장을 다시 이어 붙임.
-    앞 줄이 문장 끝(다/요/죠/!/. 등)으로 끝나지 않고, 두 줄 모두 6자 이상이면 같은 문장으로 봄.
+    앞 줄이 문장 끝(다/요/죠/!/. 등)으로 끝나지 않고 12자 이상(문단이 줄바꿈된 경우)이면 다음 줄과 이어 붙임.
+    짧은 문구(광고 구호)와 표시사항 줄(품목보고번호, 원재료, 영양 등)은 잇지 않음.
     해시태그(#), 짧은 줄(제품명·단위 등)은 그대로 둠.
     """
     out = []
     for line in [l.strip() for l in str(text).split('\n') if l.strip()]:
-        if (out and not _END.search(out[-1]) and not out[-1].startswith('#') and not line.startswith('#')
-                and len(out[-1]) >= 6 and len(line) >= 6):
+        if (out and not _END.search(out[-1]) and not out[-1].startswith('#') and not line.startswith(('#', '[', '<', '※'))
+                and len(out[-1]) >= 12 and len(line) >= 4
+                and (len(out[-1]) >= 20 or _CONT.search(out[-1]))      # 짧은 구호 줄끼리는 잇지 않음
+                and not _LABEL.search(out[-1]) and not _LABEL.search(line)):
             out[-1] = out[-1] + ' ' + line
         else:
             out.append(line)
     return '\n'.join(out)
 
 
-def analyze_image_text(text, product_fnclty=None, model_path=DEFAULT_MODEL, merge=True):
-    """OCR 글 → 문장별 분석 결과 목록 (dict 리스트, json.dumps 로 바로 응답 가능)"""
+def analyze_image_text(text, product_fnclty=None, model_path=DEFAULT_MODEL, merge=True, product_kind=None,
+                       context_text=None):
+    """OCR 글 → 문장별 분석 결과 목록 (dict 리스트, json.dumps 로 바로 응답 가능)
+    product_kind: '건강기능식품' / '일반식품' / None(제품 미확인) — 안내 문구가 달라짐"""
     from train_ad_classifier_v2 import analyze_text
-    return analyze_text(merge_lines(text) if merge else text, get_bundle(model_path), product_fnclty)
+    return analyze_text(merge_lines(text) if merge else text, get_bundle(model_path), product_fnclty,
+                        product_kind=product_kind, context_text=context_text)
 
 
 def save_text(text, path):
